@@ -115,10 +115,55 @@ __global__ void NaiveGEMM(Matrix<float> A,Matrix<float> B,Matrix<float> C) // �
 }
 
 /* BlockGEMM_V1
-
-在NaiveGEMM的基础上加上Block分块和Thread分块
 */
 __global__ void BlockGEMM_V1(Matrix<float> A,Matrix<float> B,Matrix<float> C)
+{
+    // 注意命名不要与前面的宏定义重名
+    const int BLOCK_M=16;// block的行数
+    const int BLOCK_N=16;// block的列数
+    const int BLOCK_K=16;
+
+    // 沿着K维度循环加载一个block中对应的A和B的数据到共享内存
+    float c=0.0;
+    for(int i=0;i<A.cols/BLOCK_K;++i)
+    {
+        // 每个block对应的全局内存中的A,B子块，即创建全局内存中A,B的view
+        Matrix<float> ASub(A.data+blockIdx.y*BLOCK_M*A.strideOfRow+i*BLOCK_K,BLOCK_M,BLOCK_K,A.strideOfRow,A.strideOfCol);
+        Matrix<float> BSub(B.data+i*BLOCK_K*B.strideOfRow+blockIdx.x*BLOCK_N,BLOCK_K,BLOCK_N,B.strideOfRow,B.strideOfCol);
+
+        // 将Asub,BSub加载到共享内存
+        // 注意：这里需要将一维逻辑索引转换为多维逻辑索引：stardIndex->(stardIndex/cols,stardIndex%cols)
+        __shared__ float A_Shared[BLOCK_M][BLOCK_K];
+        __shared__ float B_Shared[BLOCK_K][BLOCK_N];
+        int numberOfElementsPerThread=(BLOCK_K*BLOCK_M)/(blockDim.x*blockDim.y);// 每个线程需要读取多少数据
+        int stardIndex=numberOfElementsPerThread*(threadIdx.y*blockDim.x+threadIdx.x);// stardIndex为每个线程读取的起始索引
+        for(int threadIndex=0;threadIndex<numberOfElementsPerThread;++threadIndex)
+        {
+            int logicalIndex=stardIndex+threadIndex;
+            A_Shared[logicalIndex/BLOCK_K][logicalIndex%BLOCK_K]=ASub(logicalIndex/BLOCK_K,logicalIndex%BLOCK_K);
+            B_Shared[logicalIndex/BLOCK_N][logicalIndex%BLOCK_N]=BSub(logicalIndex/BLOCK_N,logicalIndex%BLOCK_N);
+        }
+        __syncthreads();
+
+        // 每个thread计算A的一行和B的一列
+        for(int k=0;k<BLOCK_K;++k)
+        {
+            c+=A_Shared[threadIdx.y][k]*B_Shared[k][threadIdx.x];
+        }
+        __syncthreads();
+
+    }
+
+    // 将每个线程计算好的结果写回到C矩阵
+    // CSub为每个线程对应的全局内存的C矩阵子块，创建C矩阵的view
+    Matrix<float> CSub(C.data+(blockIdx.y*BLOCK_M*C.strideOfRow+blockIdx.x*BLOCK_N),BLOCK_M,BLOCK_N,C.strideOfRow,C.strideOfCol);
+    CSub(threadIdx.y,threadIdx.x)=c;
+
+}
+
+/* BlockGEMM_V2
+*/
+__global__ void BlockGEMM_V2(Matrix<float> A,Matrix<float> B,Matrix<float> C)
 {
     // 每个线程的计算结果
     float c[TM][TN]={0.0};
@@ -190,12 +235,9 @@ __global__ void BlockGEMM_V1(Matrix<float> A,Matrix<float> B,Matrix<float> C)
 
 }
 
-/* BlockGEMM_V2
-
-在V1的基础上加上数据预取,通过计算和访存并发执行来隐藏访存的延迟
-
+/* BlockGEMM_V3
 */
-__global__ void BlockGEMM_V2(Matrix<float> A,Matrix<float> B,Matrix<float> C)
+__global__ void BlockGEMM_V3(Matrix<float> A,Matrix<float> B,Matrix<float> C)
 {
     // 每个线程的计算结果
     float c[TM][TN]={0.0};
@@ -311,12 +353,11 @@ __global__ void BlockGEMM_V2(Matrix<float> A,Matrix<float> B,Matrix<float> C)
 
 }
 
-
 int main(int argc,char *argv[])
 {
     // 创建CPU A矩阵，这里使用OpenCV读取一张图像作为A矩阵
     cv::Mat A_Host=cv::imread("Test.jpg",0); // 读取为单通道灰度图
-    cv::resize(A_Host,A_Host,cv::Size(1024,1024)); 
+    cv::resize(A_Host,A_Host,cv::Size(512,512)); 
     cv::Canny(A_Host,A_Host,50,100,3,false); // 转为二值图，控制值范围
     A_Host.convertTo(A_Host,CV_32FC1); // 转换为FP32类型
     printf("A size:%d x %d\n",A_Host.cols,A_Host.rows);
@@ -349,7 +390,7 @@ int main(int argc,char *argv[])
     cudaMalloc((void **)&dataOfC_Device, A_Host.rows*B_Host.cols*sizeof(float));
     Matrix<float> C_Device(dataOfC_Device,A_Host.rows,B_Host.cols,B_Host.cols,1);
     
-    //////////////////////////////// NaiveGEMM /////////////////////////////////////////////
+    ////////////////////////////// NaiveGEMM /////////////////////////////////////////////
     {
         int BLOCKX = 16;// 每个block的x方向线程数
         int BLOCKY = 16;// 每个block的y方向线程数
@@ -371,7 +412,7 @@ int main(int argc,char *argv[])
         int BLOCKX = 16;// 每个block的x方向线程数
         int BLOCKY = 16;// 每个block的y方向线程数
         dim3 block(BLOCKX,BLOCKY);
-        dim3 grid(C_Device.cols/BN,C_Device.rows/BM);
+        dim3 grid(C_Device.cols/BLOCKX,C_Device.rows/BLOCKY);
         for(int i=0;i<10;++i)
         {
             time1=seconds();
@@ -400,6 +441,23 @@ int main(int argc,char *argv[])
 
     }
 
+    //////////////////////////////// BlockGEMM_V3 /////////////////////////////////////////////
+    {
+        int BLOCKX = 16;// 每个block的x方向线程数
+        int BLOCKY = 16;// 每个block的y方向线程数
+        dim3 block(BLOCKX,BLOCKY);
+        dim3 grid(C_Device.cols/BN,C_Device.rows/BM);
+        for(int i=0;i<10;++i)
+        {
+            time1=seconds();
+            BlockGEMM_V3<<<grid, block>>>(A_Device,B_Device,C_Device);
+            cudaDeviceSynchronize();
+            time2=seconds();
+            printf("BlockGEMM_V3 elapsed:%f ms\n",(time2-time1)*1000);
+        }
+
+    }
+
     //////////////////////////////// cublas /////////////////////////////////////////////
     {
         cublasHandle_t handle;
@@ -419,6 +477,7 @@ int main(int argc,char *argv[])
         {
             time1=seconds();
             cublasSgemm_v2(handle,transA,transB,A_Device.rows,B_Device.cols,A_Device.cols,&alpha,A_Device.data,A_Device.cols,B_Device.data,B_Device.cols,&beta,C_Device.data,C_Device.cols);
+            cudaDeviceSynchronize();
             time2=seconds();
             printf("cublas elapsed:%f ms\n",(time2-time1)*1000);
         }
