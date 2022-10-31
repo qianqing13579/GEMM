@@ -353,17 +353,22 @@ __global__ void BlockGEMM_V3(Matrix<float> A,Matrix<float> B,Matrix<float> C)
 
 }
 
+#define MATRIX_SIZE 512
 int main(int argc,char *argv[])
 {
-    // 创建CPU A矩阵，这里使用OpenCV读取一张图像作为A矩阵
-    cv::Mat A_Host=cv::imread("Test.jpg",0); // 读取为单通道灰度图
-    cv::resize(A_Host,A_Host,cv::Size(512,512)); 
-    cv::Canny(A_Host,A_Host,50,100,3,false); // 转为二值图，控制值范围
-    A_Host.convertTo(A_Host,CV_32FC1); // 转换为FP32类型
+    // 创建CPU A,B矩阵
+    cv::Mat A_Host,B_Host;
+    A_Host.create(cv::Size(MATRIX_SIZE,MATRIX_SIZE),CV_32FC1);
+    B_Host.create(cv::Size(MATRIX_SIZE,MATRIX_SIZE),CV_32FC1);
     printf("A size:%d x %d\n",A_Host.cols,A_Host.rows);
-
-    // 创建CPU B矩阵
-    cv::Mat B_Host=A_Host.clone();
+    for(int i=0;i<A_Host.rows;++i)
+    {
+        for(int j=0;j<A_Host.cols;++j)
+        {
+            A_Host.at<float>(i,j)=rand()%10;
+            B_Host.at<float>(i,j)=rand()%10;
+        }
+    }
 
     // 计算CPU C矩阵(使用OpenCV计算矩阵乘)
     double time1,time2;
